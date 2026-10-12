@@ -11,6 +11,10 @@ Project BlindSpot is a Streamlit prototype for third-party vendor AI due diligen
 - Load and validate an Excel vendor inventory.
 - Calculate an explainable business-criticality assessment from recognized inventory ratings and categories.
 - Run a bounded Live Vendor Investigation Lab for a selected vendor.
+<<<<<<< HEAD
+- Crawl relevant same-domain public links from analyst-approved vendor seeds with a configurable depth limit and parent-URL provenance.
+=======
+>>>>>>> origin/main
 - Fetch permitted public HTML pages using URL, destination, redirect, robots.txt, timeout, response-size, and content-type checks.
 - Optionally search public GitHub repositories using the unauthenticated GitHub API.
 - Extract AI-related passages as evidence candidates with stable IDs, excerpts, source URLs, timestamps, and collection provenance.
@@ -80,7 +84,11 @@ The Live Vendor Investigation Lab is bounded public-source research, not a gener
 
 - It uses vendor URLs from the inventory and analyst-entered URLs as seeds.
 - From each seeded site, it proposes common product, documentation, developer, integration, blog, engineering, research, careers, security, trust, privacy, and subprocessor paths.
+<<<<<<< HEAD
+- It crawls relevant links found on successfully fetched pages, stays within the seeded vendor domain and subdomains, records the parent URL for each linked candidate, and stops at the configured page and depth limits.
+=======
 - It may follow relevant links on the seeded vendor domain and its subdomains.
+>>>>>>> origin/main
 - If enabled, GitHub search returns public repository candidates; a matching repository name does not prove vendor ownership.
 - It fetches only HTML/XHTML pages. It does not execute JavaScript, enumerate arbitrary subdomains, use search-engine pages, or infer website ownership from a vendor name.
 - Candidate URLs and AI-related keyword matches are not evidence of vendor AI use until their context and relevance have been reviewed.
