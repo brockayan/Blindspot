@@ -44,7 +44,11 @@ from src.collection.investigation import (
 from src.io.validation import duplicate_vendor_ids, validate_inventory
 from src.io.workbook import load_inventory
 from src.ui.report_export import build_assessment_workbook
-from src.ui.collection_page import merge_evidence_records
+from src.ui.collection_page import (
+    _determine_source_type,
+    merge_evidence_records,
+    show_collection_page,
+)
 from src.ui.intelligence_mesh import (
     build_relationship_graph,
     effective_relationship_status,
@@ -878,6 +882,65 @@ class TestInventoryAndExport(unittest.TestCase):
             "Needs review",
         )
         workbook.close()
+
+    def test_collection_page_source_type_determination(self):
+        self.assertEqual(
+            _determine_source_type(
+                {"category": "product_documentation"},
+                "https://vendor.example/docs",
+            ),
+            "official_product_documentation",
+        )
+        self.assertEqual(
+            _determine_source_type(
+                {"category": "engineering_and_jobs"},
+                "https://vendor.example/careers",
+            ),
+            "relevant_technical_job_posting",
+        )
+        self.assertEqual(
+            _determine_source_type(
+                {},
+                "https://vendor.example/blog/ai-feature",
+            ),
+            "official_technical_announcement",
+        )
+        self.assertEqual(
+            _determine_source_type(
+                {},
+                "https://github.com/vendor/repo",
+            ),
+            "developer_reference",
+        )
+        self.assertEqual(
+            _determine_source_type(
+                {},
+                "https://vendor.example/about",
+            ),
+            "indirect_technical_signal",
+        )
+
+    def test_collection_page_renders_and_populates_sources(self):
+        state = {
+            "inventory_df": pd.DataFrame([
+                {
+                    "Vendor ID": "V-001",
+                    "Vendor Name": "Automworx",
+                    "Public Website": "www.automworx.com",
+                }
+            ]),
+            "discovered_sources": {},
+            "evidence_records": [],
+            "collection_log": [],
+        }
+
+        with patch("streamlit.session_state", state):
+            show_collection_page()
+            self.assertIn("V-001", state["discovered_sources"])
+            self.assertEqual(len(state["discovered_sources"]["V-001"]), 1)
+            self.assertEqual(state["investigation_vendor_id"], "V-001")
+            self.assertEqual(state["investigation_vendor_name"], "Automworx")
+
 
 
 if __name__ == "__main__":
