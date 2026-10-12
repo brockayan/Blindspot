@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 
 streamlit
 pandas
@@ -7,3 +8,14 @@ beautifulsoup4
 networkx
 pyvis
 
+=======
+
+streamlit
+pandas
+openpyxl
+requests
+beautifulsoup4
+networkx
+pyvis
+
+>>>>>>> origin/main
