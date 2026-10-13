@@ -20,26 +20,55 @@ AI_SIGNAL_PATTERNS = {
         r"\btext generation\b",
         r"\bAI assistant\b",
         r"\bAI copilot\b",
+        r"\bAI agents?\b",
+        r"\bconversational ai\b",
+        r"\bprompt engineering\b",
+        r"\brag\b",
+        r"\bretrieval[- ]augmented generation\b",
+        r"\bgenerative model(?:s)?\b",
     ],
     "machine_learning": [
         r"\bmachine learning\b",
         r"\bML models?\b",
         r"\bpredictive model(?:s|ing)?\b",
         r"\bneural networks?\b",
+        r"\bdeep learning\b",
+        r"\bnatural language processing\b",
+        r"\bNLP\b",
+        r"\bcomputer vision\b",
+        r"\banomaly detection\b",
     ],
     "automated_decisioning": [
         r"\bautomated decision(?:s|ing)?\b",
         r"\bAI-powered decision(?:s|ing)?\b",
         r"\bintelligent automation\b",
         r"\bautomated scoring\b",
+        r"\bintelligent document processing\b",
+        r"\bidp\b",
+        r"\brobotic process automation\b",
+        r"\brpa\b",
+        r"\bworkload automation\b",
+        r"\bautomated underwriting\b",
     ],
     "model_provider": [
         r"\bOpenAI\b",
         r"\bAzure OpenAI\b",
+        r"\bMicrosoft Azure AI\b",
         r"\bAnthropic\b",
+        r"\bClaude\b",
         r"\bGoogle Gemini\b",
+        r"\bGoogle Cloud Vertex AI\b",
+        r"\bVertex AI\b",
         r"\bAmazon Bedrock\b",
+        r"\bAWS Bedrock\b",
+        r"\bAWS SageMaker\b",
         r"\bCohere\b",
+        r"\bMistral AI\b",
+        r"\bMeta Llama\b",
+        r"\bDatabricks\b",
+        r"\bSnowflake Cortex\b",
+        r"\bIBM watsonx\b",
+        r"\bHugging Face\b",
     ],
     "data_handling": [
         r"\bprompts?\b",
@@ -47,6 +76,12 @@ AI_SIGNAL_PATTERNS = {
         r"\bmodel training\b",
         r"\bdata retention\b",
         r"\bAI subprocessors?\b",
+        r"\bdata governance\b",
+        r"\bzero[- ]retention\b",
+        r"\bopt[- ]out of training\b",
+        r"\bprivacy policy\b",
+        r"\bdata processing agreement\b",
+        r"\bprompt logging\b",
     ],
 }
 
@@ -224,3 +259,94 @@ def extract_evidence_candidates(fetch_result, max_passages=100):
         )
 
     return candidates
+
+
+def extract_disclosed_model_providers(evidence_items) -> list[str]:
+    """Extract distinct disclosed AI model/infrastructure providers from evidence.
+
+    Does not infer providers from vendor names or general industry reputation.
+    """
+    providers = set()
+    provider_patterns = {
+        "OpenAI": r"\bOpenAI\b|\bChatGPT\b|\bGPT-4\b|\bGPT-3\b",
+        "Azure OpenAI": r"\bAzure OpenAI\b|\bMicrosoft Azure AI\b|\bAzure AI\b",
+        "Anthropic": r"\bAnthropic\b|\bClaude\b",
+        "Google Cloud / Gemini": r"\bGoogle Gemini\b|\bVertex AI\b|\bGoogle Cloud AI\b",
+        "Amazon Bedrock / AWS": r"\bAmazon Bedrock\b|\bAWS Bedrock\b|\bAWS SageMaker\b",
+        "Cohere": r"\bCohere\b",
+        "Mistral AI": r"\bMistral AI\b|\bMistral\b",
+        "Meta Llama": r"\bMeta Llama\b|\bLlama 2\b|\bLlama 3\b",
+        "Databricks": r"\bDatabricks\b|\bMosaicML\b",
+        "Snowflake Cortex": r"\bSnowflake Cortex\b|\bSnowflake AI\b",
+        "IBM watsonx": r"\bIBM watsonx\b|\bwatsonx\b",
+        "Hugging Face": r"\bHugging Face\b",
+    }
+
+    texts = []
+    for item in evidence_items or []:
+        if isinstance(item, str):
+            texts.append(item)
+        elif hasattr(item, "excerpt"):
+            texts.append(str(item.excerpt))
+        elif isinstance(item, dict):
+            texts.append(str(item.get("excerpt", "")))
+
+    combined = "\n".join(texts)
+    for canonical_name, pattern in provider_patterns.items():
+        if re.search(pattern, combined, flags=re.IGNORECASE):
+            providers.add(canonical_name)
+
+    return sorted(providers)
+
+
+def summarize_how_vendor_uses_ai(evidence_items, service_name: str = "") -> str:
+    """Summarize how the vendor may be using AI based on extracted evidence."""
+    signal_counts = {}
+    matched_all = set()
+
+    for item in evidence_items or []:
+        signals = []
+        terms = []
+        if hasattr(item, "signal_types"):
+            signals = item.signal_types or []
+            terms = item.matched_terms or []
+        elif isinstance(item, dict):
+            signals = item.get("signal_types", []) or []
+            terms = item.get("matched_terms", []) or []
+
+        for sig in signals:
+            signal_counts[sig] = signal_counts.get(sig, 0) + 1
+        for t in terms:
+            matched_all.add(str(t).strip())
+
+    if not signal_counts:
+        return "No public evidence of AI use was detected in the investigated sources."
+
+    usages = []
+    if signal_counts.get("generative_ai"):
+        usages.append(
+            "Generative AI / LLM capabilities (e.g. conversational assistant, automated text generation, or contextual search)"
+        )
+    if signal_counts.get("machine_learning"):
+        usages.append(
+            "Machine learning models for predictive analytics, pattern recognition, or automated classification"
+        )
+    if signal_counts.get("automated_decisioning"):
+        usages.append(
+            "Automated decisioning, intelligent document processing, or workflow automation"
+        )
+    if signal_counts.get("data_handling"):
+        usages.append(
+            "Disclosed AI data processing, prompt handling, or subprocessor data flows"
+        )
+
+    summary = "; ".join(usages)
+    if service_name:
+        summary = f"Within {service_name}: " + summary
+
+    if matched_all:
+        key_terms = sorted(matched_all, key=len, reverse=True)[:5]
+        summary += f" (Keywords: {', '.join(key_terms)})"
+
+    return summary
+

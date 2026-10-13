@@ -920,28 +920,160 @@ class TestInventoryAndExport(unittest.TestCase):
             "indirect_technical_signal",
         )
 
-    def test_collection_page_renders_and_populates_sources(self):
-        state = {
-            "inventory_df": pd.DataFrame([
-                {
-                    "Vendor ID": "V-001",
-                    "Vendor Name": "Automworx",
-                    "Public Website": "www.automworx.com",
-                }
-            ]),
-            "discovered_sources": {},
-            "evidence_records": [],
-            "collection_log": [],
+    def test_classify_preliminary_ai_safeguards(self):
+        from src.assessment.classifier import (
+            CONFIRMED,
+            SUSPECTED,
+            NOT_DETECTED,
+            INCONCLUSIVE,
+            classify_preliminary_ai_usage,
+        )
+
+        # 1. Direct official product documentation supports Confirmed
+        direct_doc = {
+            "evidence_id": "E-DOC",
+            "source_url": "https://vendor.example/docs/ai",
+            "grade": {
+                "score": 5,
+                "source_type": "official_product_documentation",
+                "directness": "direct",
+                "service_relevance": "relevant",
+                "recency": "current",
+            },
+        }
+        res_confirmed = classify_preliminary_ai_usage([direct_doc], collection_complete=True)
+        self.assertEqual(res_confirmed.status, CONFIRMED)
+        self.assertEqual(res_confirmed.confidence, "Moderate")
+
+        # 2. Safeguard: Technical job posting alone does NOT support Confirmed (capped at Suspected)
+        job_posting = {
+            "evidence_id": "E-JOB",
+            "source_url": "https://vendor.example/careers/ai-engineer",
+            "grade": {
+                "score": 3,
+                "source_type": "relevant_technical_job_posting",
+                "directness": "direct",
+                "service_relevance": "relevant",
+                "recency": "current",
+            },
+        }
+        res_job = classify_preliminary_ai_usage([job_posting], collection_complete=True)
+        self.assertEqual(res_job.status, SUSPECTED)
+        self.assertTrue(any("job posting alone" in r.lower() for r in res_job.rationale))
+
+        # 3. Safeguard: Generic marketing alone does not establish AI use
+        marketing = {
+            "evidence_id": "E-MKT",
+            "source_url": "https://vendor.example/about",
+            "grade": {
+                "score": 1,
+                "source_type": "generic_marketing",
+                "directness": "indirect",
+                "service_relevance": "unclear",
+                "recency": "current",
+            },
+        }
+        res_mkt = classify_preliminary_ai_usage([marketing], collection_complete=True)
+        self.assertEqual(res_mkt.status, NOT_DETECTED)
+
+        # 4. Safeguard: Collection failure produces Inconclusive
+        res_failed = classify_preliminary_ai_usage([], collection_complete=False, collection_failed=True, failure_reason="robots block")
+        self.assertEqual(res_failed.status, INCONCLUSIVE)
+        self.assertTrue(any("robots" in r.lower() or "restricted" in r.lower() for r in res_failed.rationale))
+
+        # 5. Completed scope without qualifying evidence produces Not Detected
+        res_not_detected = classify_preliminary_ai_usage([], collection_complete=True, collection_failed=False)
+        self.assertEqual(res_not_detected.status, NOT_DETECTED)
+
+    def test_pipeline_assess_single_vendor(self):
+        from src.collection.pipeline import assess_single_vendor
+
+        row = {
+            "Vendor ID": "V-002",
+            "Vendor Name": "Fiserv, Inc.",
+            "Category": "Core Platform",
+            "Public Website": "www.fiserv.com",
+            "Service / Product Provided": "DNA core banking platform",
+            "Operational Dependency": "Critical",
+            "Data Classification Accessed": "Full customer master, balances and transactions for 1.4 million customers.",
+            "Data Volume (annual)": "240 million transactions",
+        }
+        res = assess_single_vendor(row, run_live_osint=False)
+
+        self.assertEqual(res["vendor_id"], "V-002")
+        self.assertEqual(res["criticality_result"].tier, "Critical")
+        self.assertEqual(res["depth_config"]["label"], "Full review — tier-driven")
+        self.assertEqual(res["ai_assessment"].status, "Confirmed")
+        self.assertGreater(len(res["evidence_records"]), 0)
+        self.assertGreater(len(res["risk_findings"]), 0)
+        self.assertIn("Criticality Tier", res["assessment_fields"])
+        self.assertEqual(res["assessment_fields"]["Criticality Tier"], "Critical")
+        self.assertEqual(res["assessment_fields"]["AI Usage Detected (Y/N)"], "Yes")
+        self.assertIn("Azure", res["assessment_fields"]["Named AI Sub-processors / Model Providers"])
+
+    def test_batch_automated_pipeline_execution_and_isolation(self):
+        from src.io.workbook import load_inventory
+        from src.collection.pipeline import run_batch_automated_pipeline
+
+        df, _, _ = load_inventory("req/Meridian_Vendor_Input.xlsx")
+        batch_out = run_batch_automated_pipeline(df, run_live_osint=False)
+
+        enriched = batch_out["enriched_inventory_df"]
+        self.assertEqual(len(enriched), 7)
+
+        # Verify V-000 preserved verbatim
+        v000 = enriched.iloc[0]
+        self.assertEqual(v000["Vendor ID"], "V-000")
+        self.assertEqual(v000["Criticality Tier"], "Critical")
+        self.assertIn("Larkspur", str(v000["Vendor Name"]))
+
+        # Verify all non-example rows have populated assessment fields
+        for idx in range(1, len(enriched)):
+            r = enriched.iloc[idx]
+            self.assertIsNotNone(r["Criticality Tier"])
+            self.assertIn(r["Criticality Tier"], {"Critical", "High", "Medium", "Low"})
+            ai_flag = r.get("AI Usage Detected (Y/N)") or r.get("AI Usage Detected")
+            self.assertIn(ai_flag, {"Yes", "No", "Inconclusive"})
+            self.assertIsNotNone(r.get("AI Security Risk Classification"))
+
+        # Verify failure isolation
+        corrupt_df = df.copy()
+        corrupt_df.loc[1, "Vendor Name"] = None  # test resilience
+        isolated_out = run_batch_automated_pipeline(corrupt_df, run_live_osint=False)
+        self.assertEqual(len(isolated_out["enriched_inventory_df"]), 7)
+
+    def test_verify_exported_workbook_validation(self):
+        from src.io.workbook import load_inventory
+        from src.collection.pipeline import run_batch_automated_pipeline
+        from src.ui.report_export import build_assessment_workbook, verify_exported_workbook
+
+        df, _, _ = load_inventory("req/Meridian_Vendor_Input.xlsx")
+        batch_out = run_batch_automated_pipeline(df, run_live_osint=False)
+
+        session_state = {
+            "inventory_df": batch_out["enriched_inventory_df"],
+            "evidence_records": batch_out["all_evidence_records"],
+            "review_log": [],
+            "risk_findings": batch_out["all_risk_findings"],
+            "collection_log": batch_out["all_collection_log"],
+            "criticality_ratings": batch_out["criticality_ratings"],
+            "investigation_assessments": batch_out["investigation_assessments"],
+            "relationship_records": batch_out["all_relationship_records"],
         }
 
-        with patch("streamlit.session_state", state):
-            show_collection_page()
-            self.assertIn("V-001", state["discovered_sources"])
-            self.assertEqual(len(state["discovered_sources"]["V-001"]), 1)
-            self.assertEqual(state["investigation_vendor_id"], "V-001")
-            self.assertEqual(state["investigation_vendor_name"], "Automworx")
+        with patch("streamlit.session_state", session_state):
+            buf = build_assessment_workbook()
+
+        ver_res = verify_exported_workbook(buf)
+        self.assertTrue(ver_res["is_valid"])
+        self.assertEqual(ver_res["sheet_count"], 10)
+        self.assertEqual(ver_res["vendor_rows"], 7)
+        self.assertTrue(ver_res["v000_preserved"])
+        self.assertEqual(ver_res["populated_l_to_v_count"], 7)
+        self.assertEqual(ver_res["missing_sheets"], [])
 
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+

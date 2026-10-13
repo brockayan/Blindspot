@@ -221,7 +221,15 @@ def show_vendor_profile():
             coverage = _get(result, "coverage_percent")
 
         if isinstance(coverage, (int, float)):
-            st.write(f"**Factor coverage:** {coverage:.0%}")
+            val = round(coverage if coverage > 1.0 else coverage * 100)
+            st.write(f"**Factor coverage:** {val}%")
+        elif coverage:
+            clean_cov = str(coverage).rstrip("%").strip()
+            try:
+                val = round(float(clean_cov))
+                st.write(f"**Factor coverage:** {val}%")
+            except (ValueError, TypeError):
+                st.write(f"**Factor coverage:** {coverage}")
 
         ratings = criticality.get("ratings", {})
         notes = criticality.get("notes", {})

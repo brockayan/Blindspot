@@ -42,14 +42,24 @@ from src.assessment.scores import calculate_evidence_score
 
 from src.ui.ai_investigation import show_ai_investigation
 
+import importlib
+import src.ui.vendor_profile
+importlib.reload(src.ui.vendor_profile)
+from src.ui.vendor_profile import show_vendor_profile
+
+import src.ui.review_centre
+importlib.reload(src.ui.review_centre)
 from src.ui.review_centre import show_review_centre
 
+import src.ui.report_export
+importlib.reload(src.ui.report_export)
+from src.ui.report_export import show_report_export
+
 from src.ui.intelligence_mesh import show_intelligence_mesh as show_intelligence_mesh_page
-
 from src.ui.investigation_summary import show_investigation_summary
-
-from src.ui.vendor_profile import show_vendor_profile
 from src.ui.live_investigation_lab import show_live_investigation_lab
+
+
 
 from src.io.validation import (
     duplicate_vendor_ids,
@@ -899,7 +909,72 @@ def show_inventory():
 
     )
 
+    st.divider()
+    st.subheader("⚡ Automated Vendor Intelligence Pipeline")
+    st.markdown(
+        "Run the automated evidence-driven assessment pipeline across all eligible vendor rows: "
+        "preliminary criticality scoring, tier-driven OSINT investigation depth, evidence extraction & grading, "
+        "model-provider / subprocessor identification, preliminary AI-use classification, "
+        "and preliminary AI cybersecurity risk scoring with recommended actions."
+    )
 
+    col_pipe1, col_pipe2 = st.columns([2, 1])
+    with col_pipe1:
+        run_live_web = st.checkbox(
+            "Attempt live public OSINT fetches on vendor websites",
+            value=False,
+            help=(
+                "When unchecked (recommended for fast deterministic assessment), "
+                "the pipeline uses grounded case-study intelligence disclosures. "
+                "When checked, attempts live HTTP requests to public vendor domains."
+            ),
+            key="pipeline_run_live_web",
+        )
+    with col_pipe2:
+        launch_pipeline = st.button(
+            "⚡ Run Automated Intelligence Pipeline",
+            type="primary",
+            key="run_batch_pipeline_button",
+        )
+
+    if launch_pipeline:
+        progress_bar = st.progress(0.0)
+        status_container = st.empty()
+
+        def update_progress(phase, completed, total, message):
+            pct = min(max(completed / max(total, 1), 0.0), 1.0)
+            progress_bar.progress(pct)
+            status_container.info(f"**[{phase}]** {message}")
+
+        try:
+            from src.collection.pipeline import run_batch_automated_pipeline
+
+            batch_output = run_batch_automated_pipeline(
+                inventory_df=df,
+                run_live_osint=run_live_web,
+                progress_callback=update_progress,
+            )
+
+            st.session_state["inventory_df"] = batch_output["enriched_inventory_df"]
+            st.session_state["evidence_records"] = batch_output["all_evidence_records"]
+            st.session_state["risk_findings"] = batch_output["all_risk_findings"]
+            st.session_state["relationship_records"] = batch_output["all_relationship_records"]
+            st.session_state["criticality_ratings"] = batch_output["criticality_ratings"]
+            st.session_state["investigation_assessments"] = batch_output["investigation_assessments"]
+            st.session_state["collection_log"] = batch_output["all_collection_log"]
+            st.session_state["assessment_workbook_bytes"] = None
+
+            progress_bar.progress(1.0)
+            status_container.success(
+                f"✅ Pipeline completed! Assessed {len(batch_output['vendor_results'])} vendors, "
+                f"identified {len(batch_output['all_evidence_records'])} evidence records, "
+                f"{len(batch_output['all_risk_findings'])} risk findings, and "
+                f"{len(batch_output['all_relationship_records'])} model provider relationships. "
+                "Columns L through V are now populated for human review."
+            )
+            st.rerun()
+        except Exception as exc:
+            status_container.error(f"Automated pipeline error: {exc}")
 
     if "Vendor ID" not in df.columns or "Vendor Name" not in df.columns:
         st.error("Vendor ID and Vendor Name columns are required.")
@@ -913,9 +988,8 @@ def show_inventory():
         )
         return
 
-
-
     st.divider()
+
 
     st.subheader("Vendor criticality assessment")
 

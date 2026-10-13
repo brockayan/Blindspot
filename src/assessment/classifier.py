@@ -275,3 +275,196 @@ def classify_ai_usage(
         ],
         review_required=False,
     )
+
+
+def classify_preliminary_ai_usage(
+    evidence_records: Iterable[Any],
+    collection_complete: bool = False,
+    collection_failed: bool = False,
+    failure_reason: str = "",
+) -> AIUseAssessment:
+    """Automated preliminary AI-use classification before human review.
+
+    Applies documented safeguards:
+    - Technical job postings alone do not prove production AI use (capped at Suspected).
+    - Generic marketing language does not establish AI use in the supplied service.
+    - Direct, relevant, credible documentation/announcements support Confirmed.
+    - Not Detected requires completed scope without access failure.
+    - Failed collection or incomplete scope yields Inconclusive.
+    - Absence of public evidence is not proof of absence.
+    """
+    if collection_failed:
+        return AIUseAssessment(
+            status=INCONCLUSIVE,
+            confidence="Low",
+            summary=(
+                f"Automated public collection was limited or restricted "
+                f"({failure_reason or 'access blocked or robots policy'}). "
+                "Cannot determine AI usage from public sources alone."
+            ),
+            evidence_ids=[],
+            rationale=[
+                "Public source collection failed or was restricted by robots.txt / access controls.",
+                "Absence of public evidence is not proof of absence.",
+                "Preliminary automated status remains Inconclusive pending direct inquiry.",
+            ],
+            follow_up=[
+                "Verify vendor public accessibility and trust documentation manually.",
+                "Issue direct vendor due diligence questionnaire.",
+            ],
+            review_required=True,
+        )
+
+    records = list(evidence_records or [])
+    eligible = []
+    rejected_count = 0
+
+    for index, record in enumerate(records):
+        review_status = _normalise_status(
+            _value(record, "review_status", "Needs review")
+        )
+        if review_status == "rejected":
+            rejected_count += 1
+            continue
+
+        grade = _mapping(_value(record, "grade", {}))
+        score = _score(grade)
+        source_type = str(grade.get("source_type", "")).strip().casefold()
+        directness = _normalise_directness(grade.get("directness"))
+        relevance = _normalise_relevance(
+            grade.get("service_relevance", grade.get("relevance"))
+        )
+        recency = _normalise_status(grade.get("recency", "unknown"))
+
+        eligible.append({
+            "record": record,
+            "id": _evidence_id(record, index),
+            "score": score,
+            "source_type": source_type,
+            "directness": directness,
+            "relevance": relevance,
+            "recency": recency,
+        })
+
+    # Filter confirmed candidates:
+    # Direct, relevant, score >= 4, NOT job posting alone, NOT generic marketing, not dated
+    confirmed = [
+        item for item in eligible
+        if item["score"] >= 4
+        and item["directness"] == "direct"
+        and item["relevance"] == "relevant"
+        and item["source_type"] not in {
+            "relevant_technical_job_posting",
+            "generic_marketing",
+        }
+        and item["recency"] != "dated"
+    ]
+
+    # Filter suspected candidates:
+    # Service relevant with score >= 2 (includes job postings or indirect technical signals)
+    suspected = [
+        item for item in eligible
+        if item not in confirmed
+        and item["score"] >= 2
+        and item["relevance"] in {"relevant", "unclear"}
+        and item["source_type"] != "generic_marketing"
+    ]
+
+    if confirmed:
+        ids = [item["id"] for item in confirmed]
+        rationale = [
+            "Direct official technical documentation or announcements confirm AI capabilities.",
+            "Evidence indicates AI is relevant to the product or service supplied to Meridian.",
+            "Preliminary automated finding awaiting final human reviewer validation.",
+        ]
+        follow_up = [
+            "Review named model providers, hosting infrastructure, and subprocessors.",
+            "Validate human-in-the-loop oversight and customer data retention terms.",
+        ]
+        return AIUseAssessment(
+            status=CONFIRMED,
+            confidence="High" if len(confirmed) >= 2 else "Moderate",
+            summary=(
+                "Preliminary automated assessment identified direct, authoritative "
+                "evidence of AI use relevant to the vendor's service offering."
+            ),
+            evidence_ids=ids,
+            rationale=rationale,
+            follow_up=follow_up,
+            review_required=True,
+        )
+
+    if suspected:
+        ids = [item["id"] for item in suspected]
+        job_postings_only = all(
+            item["source_type"] == "relevant_technical_job_posting"
+            for item in suspected
+        )
+        rationale = [
+            "Public signals indicate AI activity (e.g. engineering hiring, indirect integrations).",
+            (
+                "A relevant job posting alone does not prove production AI deployment in Meridian's service."
+                if job_postings_only
+                else "Signals require context validation before establishing production AI use."
+            ),
+            "Preliminary automated finding awaiting human reviewer confirmation.",
+        ]
+        follow_up = [
+            "Seek direct product documentation or technical architectural disclosures.",
+            "Verify whether AI capabilities are active in Meridian's specific tenant/instance.",
+        ]
+        return AIUseAssessment(
+            status=SUSPECTED,
+            confidence="Moderate" if len(suspected) >= 2 else "Low",
+            summary=(
+                "Preliminary signals suggest possible AI usage, but direct proof "
+                "of production deployment in the specific service is unconfirmed."
+            ),
+            evidence_ids=ids,
+            rationale=rationale,
+            follow_up=follow_up,
+            review_required=True,
+        )
+
+    if not collection_complete:
+        return AIUseAssessment(
+            status=INCONCLUSIVE,
+            confidence="Low",
+            summary=(
+                "No qualifying AI evidence was detected, but public collection "
+                "scope is incomplete or unverified. Absence of evidence is not proof of absence."
+            ),
+            evidence_ids=[],
+            rationale=[
+                "No evidence met Confirmed or Suspected thresholds.",
+                "Collection scope has not been completed or verified.",
+                "Absence of public evidence is not proof of absence.",
+            ],
+            follow_up=[
+                "Complete investigation of vendor product, developer, and trust pages.",
+                "Document collection coverage and limitations.",
+            ],
+            review_required=True,
+        )
+
+    return AIUseAssessment(
+        status=NOT_DETECTED,
+        confidence="Low",
+        summary=(
+            "No qualifying AI-use evidence was detected across the completed "
+            "investigation scope. This does not prove that the vendor does not use AI."
+        ),
+        evidence_ids=[],
+        rationale=[
+            "No evidence met Confirmed or Suspected thresholds within the investigated scope.",
+            "Investigation scope was executed without fatal collection failures.",
+            f"{rejected_count} rejected record(s) excluded.",
+            "Absence of public evidence is not proof of absence.",
+        ],
+        follow_up=[
+            "Record collection coverage and access limitations in the assessment report.",
+            "Include standard AI disclosure obligations in annual vendor attestations.",
+        ],
+        review_required=True,
+    )
+

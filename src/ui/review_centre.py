@@ -10,6 +10,10 @@ from src.assessment.review import (
     apply_review_status,
     review_as_record,
 )
+from src.assessment.classifier import classify_ai_usage
+from src.assessment.scores import calculate_evidence_score
+from src.assessment.risk import calculate_ai_cyber_risk_score
+
 
 
 SOURCE_TYPES = {
@@ -88,6 +92,58 @@ def show_review_centre():
         hide_index=True,
     )
 
+    col_batch1, col_batch2 = st.columns([3, 1])
+    with col_batch1:
+        st.info(
+            "💡 **Understanding the 3 Scoring Pillars:**\n"
+            "• **Evidence Quality (0–100):** Average quality points of **Accepted** evidence items.\n"
+            "• **AI-Use Classification:** Shifts from *Inconclusive/Needs review* to *Confirmed* or *Suspected* as evidence is Accepted.\n"
+            "• **AI Cybersecurity Risk:** Requires active risk findings with **Accepted** evidence linked for the vendor.\n"
+            "• **Business Criticality:** Governed by inventory attributes (Data Sensitivity, Dependency, etc.), independent of evidence review."
+        )
+    with col_batch2:
+        if st.button("⚡ Accept All Graded Evidence", type="primary", key="accept_all_evidence_btn"):
+            accepted_count = 0
+            for i, rec in enumerate(evidence_records):
+                item = _evidence_dict(rec)
+                if item.get("review_status") != "Accepted":
+                    item["review_status"] = "Accepted"
+                    evidence_records[i] = item
+                    accepted_count += 1
+                    rev_record = {
+                        "evidence_id": item.get("evidence_id"),
+                        "decision": "Accepted",
+                        "reason": "Relevant and credible",
+                        "reviewer": "Reviewer (Batch Approval)",
+                        "notes": "Automated preliminary evidence accepted upon reviewer review.",
+                        "reviewed_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                    }
+                    review_log.append(rev_record)
+
+            # Re-evaluate all affected vendors
+            for rec in evidence_records:
+                vid = rec.get("vendor_id")
+                if vid:
+                    v_ev = [e for e in evidence_records if e.get("vendor_id") == vid]
+                    new_ai = classify_ai_usage(v_ev, collection_complete=True)
+                    st.session_state.setdefault("investigation_assessments", {})[vid] = {
+                        "vendor_id": vid,
+                        "vendor_name": rec.get("vendor_name", ""),
+                        "status": new_ai.status,
+                        "confidence": new_ai.confidence,
+                        "summary": new_ai.summary,
+                        "evidence_ids": new_ai.evidence_ids,
+                        "rationale": new_ai.rationale,
+                        "follow_up": new_ai.follow_up,
+                        "review_required": new_ai.review_required,
+                    }
+
+            st.session_state["evidence_records"] = evidence_records
+            st.session_state["review_log"] = review_log
+            st.session_state["assessment_workbook_bytes"] = None
+            st.success(f"Accepted {accepted_count} evidence records! Scores and AI-use classifications updated.")
+            st.rerun()
+
     evidence_ids = [
         str(_get(record, "evidence_id", f"Evidence {index + 1}"))
         for index, record in enumerate(evidence_records)
@@ -108,7 +164,28 @@ def show_review_centre():
     if current_grade.get("rationale"):
         st.caption(f"Current grade rationale: {current_grade['rationale']}")
 
+    vendor_id = original.get("vendor_id", "")
+    vendor_ev = [e for e in evidence_records if _get(e, "vendor_id") == vendor_id]
+    vendor_findings = [f for f in st.session_state.get("risk_findings", []) if _get(f, "vendor_id") == vendor_id]
+    ev_score = calculate_evidence_score(vendor_ev)
+    risk_score = calculate_ai_cyber_risk_score(vendor_findings, evidence_records=vendor_ev)
+    crit_info = st.session_state.get("criticality_ratings", {}).get(vendor_id, {})
+    crit_val = getattr(crit_info.get("result"), "score", None) if crit_info else None
+    ai_status = st.session_state.get("investigation_assessments", {}).get(vendor_id, {}).get("status", "Needs review")
+
+    st.markdown(f"#### Live vendor metrics: {original.get('vendor_name', vendor_id)}")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric("Criticality (Inventory)", f"{crit_val:.1f}" if crit_val is not None else "Unassessed")
+    with m2:
+        st.metric("Evidence Quality", f"{ev_score['score']:.1f}" if ev_score['score'] is not None else "Unassessed")
+    with m3:
+        st.metric("AI-Use Status", ai_status)
+    with m4:
+        st.metric("Cyber Risk Index", f"{risk_score['score']:.1f}" if risk_score['score'] is not None else "Unassessed")
+
     st.markdown("### Evidence details")
+
     st.write("**Vendor:**", original.get("vendor_name", "Unknown"))
     st.write("**Source:**", original.get("source_url", "Not provided"))
     st.write("**Excerpt:**", original.get("excerpt", "No excerpt available"))
@@ -260,9 +337,26 @@ def show_review_centre():
             st.session_state["evidence_records"] = evidence_records
             st.session_state["review_log"] = review_log
             vendor_id = original.get("vendor_id")
-            st.session_state.get(
-                "investigation_assessments", {}
-            ).pop(vendor_id, None)
+            if vendor_id:
+                vendor_ev = [
+                    e for e in evidence_records
+                    if _get(e, "vendor_id") == vendor_id
+                ]
+                new_ai = classify_ai_usage(
+                    evidence_records=vendor_ev,
+                    collection_complete=True,
+                )
+                st.session_state.setdefault("investigation_assessments", {})[vendor_id] = {
+                    "vendor_id": vendor_id,
+                    "vendor_name": original.get("vendor_name", ""),
+                    "status": new_ai.status,
+                    "confidence": new_ai.confidence,
+                    "summary": new_ai.summary,
+                    "evidence_ids": new_ai.evidence_ids,
+                    "rationale": new_ai.rationale,
+                    "follow_up": new_ai.follow_up,
+                    "review_required": new_ai.review_required,
+                }
             st.session_state["assessment_workbook_bytes"] = None
 
             st.success(
