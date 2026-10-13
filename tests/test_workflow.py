@@ -1073,7 +1073,709 @@ class TestInventoryAndExport(unittest.TestCase):
         self.assertEqual(ver_res["missing_sheets"], [])
 
 
+class TestAssessmentConsistencyAndIntegrity(unittest.TestCase):
+    """Regression test suite for assessment consistency, risk claim gating, and evidence integrity."""
+
+    @classmethod
+    def setUpClass(cls):
+        from src.io.workbook import load_inventory
+        from src.collection.pipeline import run_batch_automated_pipeline
+
+        cls.df, _, _ = load_inventory("req/Meridian_Vendor_Input.xlsx")
+        cls.batch_out = run_batch_automated_pipeline(cls.df, run_live_osint=False)
+
+    def _get_exported_workbook(self, session_overrides=None):
+        from src.ui.report_export import build_assessment_workbook
+
+        session_state = {
+            "inventory_df": self.batch_out["enriched_inventory_df"].copy(),
+            "evidence_records": list(self.batch_out["all_evidence_records"]),
+            "review_log": [],
+            "risk_findings": list(self.batch_out["all_risk_findings"]),
+            "collection_log": list(self.batch_out["all_collection_log"]),
+            "criticality_ratings": dict(self.batch_out["criticality_ratings"]),
+            "investigation_assessments": dict(self.batch_out["investigation_assessments"]),
+            "relationship_records": list(self.batch_out["all_relationship_records"]),
+        }
+        if session_overrides:
+            session_state.update(session_overrides)
+
+        with patch("streamlit.session_state", session_state):
+            buf = build_assessment_workbook()
+        return load_workbook(BytesIO(buf.getvalue()), data_only=True)
+
+    def test_1_cross_sheet_ai_classification_consistency(self):
+        """P0: Verify AI classifications match across Vendor Inventory, AI Investigation Summary, and Vendor Scores."""
+        wb = self._get_exported_workbook()
+
+        # Read Vendor Inventory rows
+        inv_sheet = wb["Vendor Inventory"]
+        inv_headers = [cell.value for cell in inv_sheet[1]]
+        vid_col = inv_headers.index("Vendor ID") + 1
+        ai_col = inv_headers.index("AI Usage Detected (Y/N)") + 1
+        inv_ai = {}
+        for r in range(2, inv_sheet.max_row + 1):
+            vid = inv_sheet.cell(r, vid_col).value
+            if vid:
+                inv_ai[str(vid).strip()] = inv_sheet.cell(r, ai_col).value
+
+        # Read AI Investigation Summary
+        ai_sheet = wb["AI Investigation Summary"]
+        ai_headers = [cell.value for cell in ai_sheet[1]]
+        ai_vid_col = ai_headers.index("vendor_id") + 1
+        ai_status_col = ai_headers.index("status") + 1
+        summary_status = {}
+        for r in range(2, ai_sheet.max_row + 1):
+            vid = ai_sheet.cell(r, ai_vid_col).value
+            if vid:
+                summary_status[str(vid).strip()] = ai_sheet.cell(r, ai_status_col).value
+
+        # Read Vendor Scores
+        scores_sheet = wb["Vendor Scores"]
+        score_headers = [cell.value for cell in scores_sheet[1]]
+        sc_vid_col = score_headers.index("Vendor ID") + 1
+        sc_ai_col = score_headers.index("AI-use Classification") + 1
+        scores_ai = {}
+        for r in range(2, scores_sheet.max_row + 1):
+            vid = scores_sheet.cell(r, sc_vid_col).value
+            if vid:
+                scores_ai[str(vid).strip()] = scores_sheet.cell(r, sc_ai_col).value
+
+        # V-001 AutomWorx: Inventory = No, Investigation Summary = Not Detected, Vendor Scores = Not Detected
+        self.assertEqual(inv_ai.get("V-001"), "No")
+        self.assertEqual(summary_status.get("V-001"), "Not Detected")
+        self.assertEqual(scores_ai.get("V-001"), "Not Detected")
+        self.assertNotIn("Suspected", [inv_ai.get("V-001"), summary_status.get("V-001"), scores_ai.get("V-001")])
+
+        # V-003 FSSI: Inventory = Inconclusive, Investigation Summary = Inconclusive, Vendor Scores = Inconclusive
+        self.assertEqual(inv_ai.get("V-003"), "Inconclusive")
+        self.assertIn("Inconclusive", str(summary_status.get("V-003")))
+        self.assertIn("Inconclusive", str(scores_ai.get("V-003")))
+        self.assertNotIn("Suspected", [inv_ai.get("V-003"), summary_status.get("V-003"), scores_ai.get("V-003")])
+
+        # V-004 Terrapin: Inventory = Inconclusive, Investigation Summary = Inconclusive, Vendor Scores = Inconclusive
+        self.assertEqual(inv_ai.get("V-004"), "Inconclusive")
+        self.assertIn("Inconclusive", str(summary_status.get("V-004")))
+        self.assertIn("Inconclusive", str(scores_ai.get("V-004")))
+        self.assertNotIn("Suspected", [inv_ai.get("V-004"), summary_status.get("V-004"), scores_ai.get("V-004")])
+
+        # V-002, V-005, V-006: Inventory = Yes, Investigation Summary = Confirmed, Vendor Scores = Confirmed
+        for vid in ["V-002", "V-005", "V-006"]:
+            self.assertEqual(inv_ai.get(vid), "Yes")
+            self.assertEqual(summary_status.get(vid), "Confirmed")
+            self.assertEqual(scores_ai.get(vid), "Confirmed")
+        wb.close()
+
+    def test_2_ai_specific_risk_gating_for_no_and_inconclusive(self):
+        """P0: Gating ensures No/Inconclusive AI classifications do not assert affirmative AI data processing claims."""
+        findings = self.batch_out["all_risk_findings"]
+
+        # V-001 AutomWorx (No / Not Detected):
+        v1_findings = [f for f in findings if f.get("vendor_id") == "V-001"]
+        self.assertTrue(len(v1_findings) >= 1)
+        for f in v1_findings:
+            desc = str(f.get("description", "")).lower()
+            rat = str(f.get("rationale", "")).lower()
+            self.assertNotIn("embedded ml models process live transaction", desc)
+            self.assertNotIn("prompt exposure risk", desc)
+            self.assertIn(f.get("risk_type"), {"assurance_gap", "conditional"})
+            self.assertEqual(f.get("severity"), "Low")
+
+        # V-003 FSSI & V-004 Terrapin (Inconclusive):
+        for vid in ["V-003", "V-004"]:
+            v_findings = [f for f in findings if f.get("vendor_id") == vid]
+            self.assertTrue(len(v_findings) >= 1)
+            for f in v_findings:
+                self.assertIn(f.get("risk_type"), {"assurance_gap", "conditional"})
+                desc = str(f.get("description", "")).lower()
+                rat = str(f.get("rationale", "")).lower()
+                self.assertNotIn("public evidence confirms ai use", rat)
+
+    def test_3_curated_evidence_never_misrepresented_as_live_verified(self):
+        """P0: Curated disclosures preserve provenance and are never represented as live-verified."""
+        evidence = self.batch_out["all_evidence_records"]
+        col_log = self.batch_out["all_collection_log"]
+
+        curated_ev = [e for e in evidence if e.get("data_origin") == "curated_case_study_disclosure"]
+        self.assertTrue(len(curated_ev) >= 1)
+        for e in curated_ev:
+            self.assertEqual(e.get("data_origin"), "curated_case_study_disclosure")
+            self.assertIn("[Curated Reference]", str(e.get("source_title", "")))
+            self.assertEqual(e.get("grade", {}).get("corroboration"), "not_corroborated")
+
+        # Collection log records curated origin
+        curated_log = [l for l in col_log if l.get("data_origin") == "curated_case_study_disclosure"]
+        self.assertTrue(len(curated_log) >= 1)
+        for l in curated_log:
+            self.assertEqual(l.get("status"), "curated_disclosure")
+
+    def test_4_provider_extraction_requiring_supporting_evidence(self):
+        """P1: Provider extraction must be grounded in source text. No direct OpenAI inferred from Azure OpenAI."""
+        from src.collection.extractor import extract_disclosed_model_providers
+
+        # Fiserv DNA excerpt does not name Azure AI
+        fiserv_excerpt = "Fiserv DNA integrates predictive analytics and machine learning capabilities for transaction pattern analysis."
+        fiserv_providers = extract_disclosed_model_providers([{"excerpt": fiserv_excerpt}])
+        self.assertNotIn("Microsoft Azure AI", fiserv_providers)
+        self.assertNotIn("Azure", [p.lower() for p in fiserv_providers])
+
+        # BNY excerpt mentions Azure OpenAI Service: direct OpenAI must NOT be extracted
+        bny_excerpt = "BNY Enterprise AI Hub leverages Microsoft Azure OpenAI Service and custom machine learning models."
+        bny_providers = extract_disclosed_model_providers([{"excerpt": bny_excerpt}])
+        self.assertIn("Microsoft Azure OpenAI Service", bny_providers)
+        self.assertNotIn("OpenAI", bny_providers)
+
+        # Verify Fiserv Azure relationship in batch output is unverified
+        relationships = self.batch_out["all_relationship_records"]
+        v2_rels = [r for r in relationships if r.get("vendor_id") == "V-002" and "azure" in r.get("entity_name", "").lower()]
+        for r in v2_rels:
+            self.assertIn("unverified", r.get("status", "").lower())
+
+    def test_5_duplicate_and_irrelevant_source_handling(self):
+        """P1: Repeated passages from same URL deduplicated; third-party GitHub searches marked not relevant."""
+        from src.collection.extractor import extract_evidence_candidates
+        from src.collection.fetcher import FetchResult
+
+        repeated_html = """
+        <html><body>
+        <p>Our platform uses machine learning algorithms for automated decisioning.</p>
+        <p>Our platform uses machine learning algorithms for automated decisioning.</p>
+        <p>Third paragraph with machine learning algorithms.</p>
+        </body></html>
+        """
+        page = FetchResult(
+            url="https://github.com/example/repo",
+            status="success",
+            retrieved_at="2026-10-13T00:00:00Z",
+            http_status=200,
+            html=repeated_html,
+        )
+        candidates = extract_evidence_candidates(page)
+        self.assertEqual(len(candidates), 1)
+
+    def test_6_reviewer_decisions_remaining_distinct_from_automated_findings(self):
+        """P1: Reviewer actions record distinct decisions and synchronize dependent outputs."""
+        from src.assessment.review import sync_vendor_after_review
+
+        inventory = self.batch_out["enriched_inventory_df"].copy()
+        evidence = [dict(e) for e in self.batch_out["all_evidence_records"]]
+        investigations = dict(self.batch_out["investigation_assessments"])
+        risks = [dict(f) for f in self.batch_out["all_risk_findings"]]
+
+        # Simulate reviewer approving evidence for V-005
+        for e in evidence:
+            if e.get("vendor_id") == "V-005":
+                e["review_status"] = "Accepted"
+
+        res = sync_vendor_after_review(
+            "V-005",
+            evidence_records=evidence,
+            inventory_df=inventory,
+            investigation_assessments=investigations,
+            risk_findings=risks,
+            reviewer_name="Senior Risk Assessor",
+        )
+        self.assertEqual(res["vendor_id"], "V-005")
+        self.assertEqual(res["detected_flag"], "Yes")
+
+        v5_row = inventory[inventory["Vendor ID"] == "V-005"].iloc[0]
+        self.assertIn("Reviewer (Senior Risk Assessor)", str(v5_row.get("Assessedd By / Date")))
+
+    def test_7_excel_and_csv_exports_reflect_same_authoritative_assessment(self):
+        """P1: Excel and CSV exports produce identical vendor assessment fields."""
+        from src.ui.report_export import populate_export_inventory
+
+        enriched_inv = self.batch_out["enriched_inventory_df"].copy()
+        csv_df = populate_export_inventory(
+            enriched_inv,
+            assessments=self.batch_out["criticality_ratings"],
+            investigations=self.batch_out["investigation_assessments"],
+            evidence=self.batch_out["all_evidence_records"],
+            findings=self.batch_out["all_risk_findings"],
+            relationships=self.batch_out["all_relationship_records"],
+        )
+
+        wb = self._get_exported_workbook()
+        inv_sheet = wb["Vendor Inventory"]
+        inv_headers = [cell.value for cell in inv_sheet[1]]
+
+        for r_idx in range(2, inv_sheet.max_row + 1):
+            vid = inv_sheet.cell(r_idx, inv_headers.index("Vendor ID") + 1).value
+            if not vid or str(vid).strip().lower() == "nan":
+                continue
+            vid_str = str(vid).strip()
+            csv_row = csv_df[csv_df["Vendor ID"] == vid_str].iloc[0]
+
+            for col in ["Criticality Tier", "AI Usage Detected (Y/N)", "AI Security Risk Classification"]:
+                if col in inv_headers and col in csv_df.columns:
+                    excel_val = inv_sheet.cell(r_idx, inv_headers.index(col) + 1).value
+                    csv_val = csv_row[col]
+                    self.assertEqual(
+                        str(excel_val or "").strip(),
+                        str(csv_val or "").strip(),
+                        f"Mismatch for vendor {vid_str} in column {col}: Excel={excel_val}, CSV={csv_val}"
+                    )
+        wb.close()
+
+    def test_8_preservation_of_input_workbook_and_v000_example(self):
+        """P1: req/Meridian_Vendor_Input.xlsx and V-000 Larkspur worked example preserved verbatim."""
+        from src.io.workbook import load_inventory
+
+        raw_df, _, _ = load_inventory("req/Meridian_Vendor_Input.xlsx")
+        v0_raw = raw_df[raw_df["Vendor ID"] == "V-000"].iloc[0]
+        self.assertIn("Larkspur", str(v0_raw["Vendor Name"]))
+
+        enriched = self.batch_out["enriched_inventory_df"]
+        v0_enriched = enriched[enriched["Vendor ID"] == "V-000"].iloc[0]
+        self.assertEqual(v0_enriched["Vendor ID"], "V-000")
+        self.assertEqual(v0_enriched["Criticality Tier"], "Critical")
+        self.assertEqual(v0_enriched["AI Usage Detected (Y/N)"], "Yes")
+        self.assertIn("Larkspur", str(v0_enriched["Vendor Name"]))
+
+    def test_9_automworx_not_classified_suspected_from_workload_automation_or_blog_title(self):
+        """AutomWorx (V-001) must not be classified Suspected solely because workload automation or blog mentions AI Agents."""
+        from src.assessment.classifier import NOT_DETECTED, classify_preliminary_ai_usage
+
+        curated_ev = {
+            "evidence_id": "E-CURATED-V1",
+            "source_url": "https://www.automworx.com/services/workload-automation",
+            "source_title": "[Curated Reference] AutomWorx Enterprise Workload Automation Services",
+            "data_origin": "curated_case_study_disclosure",
+            "excerpt": "Specialized consulting and managed support for Automic, AppWorx, and UC4 workload automation engines.",
+            "ai_usage_detected": "No",
+            "signal_types": ["non_ai_service_disclosure", "curated_case_study_disclosure"],
+            "grade": {
+                "score": 5,
+                "source_type": "official_product_documentation",
+                "directness": "indirect",
+                "service_relevance": "relevant",
+                "recency": "current",
+            },
+        }
+        live_blog_ev = {
+            "evidence_id": "E-LIVE-BLOG-V1",
+            "source_url": "https://www.automworx.com/",
+            "source_title": "AutomWorx Consulting",
+            "data_origin": "live_public_web",
+            "excerpt": "October 8, 2026 Before You Put AI Agents on the Schedule: Start With What Already Runs",
+            "signal_types": ["generative_ai"],
+            "grade": {
+                "score": 2,
+                "source_type": "official_product_documentation",
+                "directness": "unclear",
+                "service_relevance": "relevant",
+                "recency": "current",
+            },
+        }
+
+        # With both curated non-AI disclosure and blog commentary:
+        ass = classify_preliminary_ai_usage([curated_ev, live_blog_ev], collection_complete=True)
+        self.assertEqual(ass.status, NOT_DETECTED)
+        self.assertNotIn("Suspected", ass.status)
+        self.assertTrue(any("rule-based" in r.lower() or "curated" in r.lower() for r in ass.rationale))
+
+    def test_10_unrelated_github_repositories_excluded_from_evidence_and_conclusions(self):
+        """Unrelated third-party GitHub repositories (api-evangelist, bnycftc) are excluded from evidence register."""
+        from src.collection.investigation import run_full_investigation
+        from src.collection.fetcher import FetchResult
+
+        class MockFetcher:
+            def fetch_page(self, url):
+                if "api-evangelist" in url:
+                    html = "<html><body><h1>This is not our API. Independent profile by API Evangelist.</h1></body></html>"
+                elif "bnycftc" in url:
+                    html = "<html><body><h1>Shorts Creator app</h1></body></html>"
+                else:
+                    html = "<html><body><p>BNY Enterprise AI Hub uses Microsoft Azure OpenAI Service.</p></body></html>"
+                return FetchResult(
+                    url=url,
+                    status="success",
+                    retrieved_at="2026-10-13T00:00:00Z",
+                    http_status=200,
+                    html=html,
+                )
+
+        mock_searcher = lambda query: ([
+            "https://github.com/api-evangelist/bny-mellon",
+            "https://github.com/bnycftc/bnycftc.github.io",
+        ], "GitHub public repository search returned 2 candidate(s).")
+
+        res = run_full_investigation(
+            vendor_id="V-005",
+            vendor_name="BNY",
+            seed_urls=["https://www.bny.com"],
+            fetcher=MockFetcher(),
+            github_searcher=mock_searcher,
+            include_github=True,
+            max_pages=5,
+            max_depth=1,
+        )
+
+        evidence_urls = [e.get("source_url") for e in res["evidence_records"]]
+        self.assertNotIn("https://github.com/api-evangelist/bny-mellon", evidence_urls)
+        self.assertNotIn("https://github.com/bnycftc/bnycftc.github.io", evidence_urls)
+
+        # Check collection log records exclusions
+        excluded_log = [l for l in res["collection_log"] if l.get("status") == "excluded_unrelated_third_party"]
+        self.assertEqual(len(excluded_log), 2)
+
+    def test_11_evidence_description_provenance_labels_curated_vs_live(self):
+        """Curated reference disclosures must be labeled as simulation references without misleading live retrieval dates."""
+        enriched = self.batch_out["enriched_inventory_df"]
+        v1_row = enriched[enriched["Vendor ID"] == "V-001"].iloc[0]
+        v1_desc = str(v1_row.get("Evidence Description along with OSINT Source(s) / Evidence Link", ""))
+        self.assertIn("[Curated Case-Study Reference — Not Independently Verified Live OSINT]", v1_desc)
+        self.assertNotIn("Independently retrieved live OSINT — Source: [Curated Reference]", v1_desc)
+
+    def test_12_unreviewed_evidence_status_is_needs_review_not_human_approved(self):
+        """Automated evidence must remain 'Needs review' and preliminary risk findings 'Preliminary' until human action."""
+        for ev in self.batch_out["all_evidence_records"]:
+            self.assertEqual(ev.get("review_status"), "Needs review")
+            self.assertNotEqual(ev.get("review_status"), "Accepted")
+
+        for finding in self.batch_out["all_risk_findings"]:
+            self.assertEqual(finding.get("status"), "Preliminary")
+            self.assertNotEqual(finding.get("status"), "Reviewed")
+
+
+    def test_13_automworx_rationale_does_not_claim_proof_of_no_ai_and_confidence_is_moderate(self):
+        """AutomWorx rationale must not describe absence of evidence as proof of no AI deployment; confidence is Moderate."""
+        inv = self.batch_out["investigation_assessments"].get("V-001")
+        self.assertIsNotNone(inv)
+        self.assertEqual(inv["confidence"], "Moderate")
+        summary_text = str(inv["summary"]).lower()
+        self.assertIn("absence of public evidence", summary_text)
+        self.assertIn("does not", summary_text)
+        # Check rationale
+        combined_rat = " ".join(str(r) for r in inv.get("rationale", [])).lower()
+        self.assertIn("absence of public evidence does not prove", combined_rat)
+
+    def test_14_terrapin_blocked_live_collection_reflected_in_completeness_and_rationale(self):
+        """Terrapin blocked live collection must be reflected in assessment completeness and rationale."""
+        from src.collection.pipeline import assess_single_vendor
+        row_v4 = self.df[self.df["Vendor ID"] == "V-004"].iloc[0]
+        res = assess_single_vendor(row_v4, run_live_osint=True)
+        self.assertEqual(res["ai_assessment"].status, "Inconclusive/Needs Review")
+        summary = str(res["ai_assessment"].summary).lower()
+        self.assertTrue("blocked by robots.txt" in summary or "robots" in summary)
+        ev_desc = str(res["assessment_fields"]["Evidence Description along with OSINT Source(s) / Evidence Link"])
+        self.assertIn("Completeness note: Live public web collection was blocked by vendor robots.txt policy restrictions", ev_desc)
+
+    def test_15_fssi_and_terrapin_risk_rationales_maintain_conditional_claims(self):
+        """FSSI and Terrapin risk rationales must maintain conditional claims without unbacked assumptions."""
+        from src.collection.pipeline import CURATED_CASE_STUDY_DISCLOSURES
+        for vid in ["V-003", "V-004"]:
+            curated = CURATED_CASE_STUDY_DISCLOSURES[vid]
+            rat = str(curated["risk_rationale"])
+            self.assertIn("If ", rat)
+            self.assertIn("Conversely, if ", rat)
+            self.assertIn("unconfirmed pending", rat)
+            self.assertNotIn("automated processing is largely deterministic", rat.lower())
+            self.assertNotIn("suggests internal heuristics", rat.lower())
+
+    def test_16_full_risk_findings_export_csv_synchronization(self):
+        """Full risk findings register exports all findings across vendors and agrees with workbook Risk Findings sheet."""
+        from src.assessment.risk import findings_as_records
+        from src.ui.report_export import build_assessment_workbook
+        from openpyxl import load_workbook
+        from io import BytesIO
+
+        findings = self.batch_out["all_risk_findings"]
+        findings_df = pd.DataFrame(findings_as_records(findings))
+        self.assertGreaterEqual(len(findings_df), 6)
+        vendor_ids = set(findings_df["Vendor ID"].unique())
+        self.assertTrue({"V-001", "V-002", "V-003", "V-004", "V-005", "V-006"}.issubset(vendor_ids))
+
+        # Check workbook
+        state = {
+            "inventory_df": self.batch_out["enriched_inventory_df"],
+            "evidence_records": self.batch_out["all_evidence_records"],
+            "review_log": [],
+            "risk_findings": findings,
+            "collection_log": self.batch_out["all_collection_log"],
+            "criticality_ratings": self.batch_out["criticality_ratings"],
+            "investigation_assessments": self.batch_out["investigation_assessments"],
+            "relationship_records": self.batch_out["all_relationship_records"],
+        }
+        with patch("streamlit.session_state", state):
+            wb_bytes = build_assessment_workbook()
+        wb = load_workbook(BytesIO(wb_bytes.getvalue()), read_only=True)
+        rf_sheet = wb["Risk Findings"]
+        self.assertEqual(rf_sheet.max_row - 1, len(findings_df))
+        wb.close()
+
+    def test_17_false_positive_ai_signals_rejected(self):
+        """Evidence without qualifying AI signals or relevant service claims must not produce Confirmed or Suspected."""
+        from src.assessment.classifier import _has_qualifying_ai_signals, classify_ai_usage
+
+        # Non-AI IT workload/database evidence
+        db_evidence = {
+            "evidence_id": "E-DB-1",
+            "vendor_id": "V-999",
+            "source_url": "https://example.com/infrastructure",
+            "source_title": "Enterprise Database Replication",
+            "excerpt": "Enterprise PostgreSQL database replication and high-availability backup clustering.",
+            "grade": {
+                "score": 5,
+                "directness": "direct",
+                "service_relevance": "relevant",
+                "recency": "current",
+            },
+            "review_status": "Accepted",
+        }
+        self.assertFalse(_has_qualifying_ai_signals(db_evidence))
+        ass = classify_ai_usage([db_evidence], collection_complete=True)
+        self.assertEqual(ass.status, "Not Detected")
+
+        # Irrelevant evidence
+        irrelevant_ai = {
+            "evidence_id": "E-IRR-1",
+            "vendor_id": "V-999",
+            "source_url": "https://example.com/cafeteria",
+            "source_title": "Cafeteria Smart Robot",
+            "excerpt": "Our cafeteria features an AI robot for automated dish cleaning.",
+            "grade": {
+                "score": 4,
+                "directness": "direct",
+                "service_relevance": "irrelevant",
+                "recency": "current",
+            },
+            "review_status": "Accepted",
+        }
+        self.assertFalse(_has_qualifying_ai_signals(irrelevant_ai))
+        ass_irr = classify_ai_usage([irrelevant_ai], collection_complete=True)
+        self.assertEqual(ass_irr.status, "Not Detected")
+
+    def test_18_unrelated_accepted_evidence_does_not_validate_risk(self):
+        """Accepted evidence only supports a risk finding when its content substantiates that finding's theme."""
+        from src.assessment.risk import calculate_ai_cyber_risk_score, create_risk_finding
+
+        finding = create_risk_finding(
+            vendor_id="V-100",
+            vendor_name="Acme Analytics",
+            theme="retention_and_training",
+            severity="Critical",
+            likelihood="Likely",
+            rationale="Customer data processed by external AI could be retained or used for foundation model training.",
+            evidence_ids=["E-MENU"],
+            status="Preliminary",
+        ).to_dict()
+
+        # Accepted evidence, but completely unrelated to retention_and_training
+        unrelated_evidence = {
+            "evidence_id": "E-MENU",
+            "vendor_id": "V-100",
+            "review_status": "Accepted",
+            "source_title": "Office Cafeteria Guidelines",
+            "excerpt": "Our building cafeteria offers organic meal subscriptions and daily lunch menus.",
+            "grade": {
+                "score": 4,
+                "service_relevance": "relevant",
+                "directness": "direct",
+            },
+        }
+
+        eval_unrelated = calculate_ai_cyber_risk_score([finding], evidence_records=[unrelated_evidence])
+        self.assertIsNone(eval_unrelated["score"])
+        self.assertEqual(eval_unrelated["unsupported_findings"], 1)
+
+        # Substantiating evidence
+        substantiating_evidence = {
+            "evidence_id": "E-MENU",
+            "vendor_id": "V-100",
+            "review_status": "Accepted",
+            "source_title": "AI Model Training & Retention Policy",
+            "excerpt": "Customer inputs and training data are stored for continuous machine learning model training.",
+            "signal_types": ["model_training", "data_retention"],
+            "grade": {
+                "score": 5,
+                "service_relevance": "relevant",
+                "directness": "direct",
+            },
+        }
+        eval_supported = calculate_ai_cyber_risk_score([finding], evidence_records=[substantiating_evidence])
+        self.assertEqual(eval_supported["score"], 100.0)
+
+    def test_19_incomplete_collection_preserves_uncertainty_in_sync(self):
+        """sync_vendor_after_review must preserve Inconclusive when collection failed or was incomplete."""
+        from src.assessment.review import sync_vendor_after_review
+
+        # Vendor with no accepted positive evidence and a failed/blocked collection log
+        collection_log = [{
+            "vendor_id": "V-BLOCKED",
+            "status": "blocked",
+            "details": "Robots.txt policy disallowed scraping /platform",
+        }]
+
+        res = sync_vendor_after_review(
+            "V-BLOCKED",
+            evidence_records=[],
+            collection_log=collection_log,
+            collection_complete=False,
+            collection_failed=True,
+            failure_reason="Robots.txt policy disallowed scraping /platform",
+        )
+        self.assertEqual(res["ai_status"], "Inconclusive/Needs Review")
+        self.assertEqual(res["detected_flag"], "Inconclusive")
+
+    def test_20_reviewer_acceptance_distinct_from_automated_grading(self):
+        """Automated grading leaves evidence in 'Needs review'; evidence is Accepted only through explicit action."""
+        from src.assessment.evidence import create_evidence_record
+        from src.assessment.review import review_evidence, apply_review_status
+
+        candidate = {
+            "source_url": "https://example.com/ai-docs",
+            "source_title": "AI Documentation",
+            "excerpt": "Our platform integrates machine learning models for predictive scoring.",
+            "signal_types": ["machine_learning"],
+            "matched_terms": ["machine learning"],
+        }
+        rec = create_evidence_record(
+            candidate=candidate,
+            vendor_id="V-777",
+            vendor_name="Test Vendor",
+            source_type="official_product_documentation",
+            directness="direct",
+            service_relevance="relevant",
+        ).to_dict()
+
+        # Automated pipeline produces 'Needs review'
+        self.assertEqual(rec.get("review_status"), "Needs review")
+        self.assertNotEqual(rec.get("review_status"), "Accepted")
+
+        # Explicit reviewer decision transitions status to Accepted
+        decision = review_evidence(
+            rec,
+            decision="Accepted",
+            reviewer="Security Analyst",
+            reason="Relevant and credible",
+            notes="Verified documentation link.",
+        )
+        updated_rec = apply_review_status(rec, decision)
+        self.assertEqual(updated_rec.get("review_status"), "Accepted")
+        self.assertEqual(updated_rec.get("reviewer"), "Security Analyst")
+
+    def test_21_unrelated_vendor_inventory_does_not_apply_case_study_fixtures(self):
+        """Curated case-study fixtures are not applied to unrelated vendor inventories matching IDs by accident."""
+        from src.collection.pipeline import assess_single_vendor
+        from src.collection.fixtures import get_curated_case_study_disclosure
+
+        # V-001 but named Acme Corp (unrelated to AutomWorx)
+        unrelated_row = {
+            "Vendor ID": "V-001",
+            "Vendor Name": "Acme Logistics Corp",
+            "Category": "Freight & Shipping",
+            "Public Website": "www.acmelogistics.example",
+            "Service / Product Provided": "Freight delivery and freight forwarding",
+            "Operational Dependency": "Low",
+            "Data Classification Accessed": "Internal operational shipping addresses.",
+            "Data Volume (annual)": "50,000 shipments",
+        }
+
+        # Verify fixture getter returns None for unrelated vendor
+        self.assertIsNone(get_curated_case_study_disclosure("V-001", vendor_name="Acme Logistics Corp"))
+
+        # Verify assess_single_vendor does not apply AutomWorx curated fixture
+        res = assess_single_vendor(unrelated_row, run_live_osint=False)
+        self.assertNotIn("AutomWorx", str(res["assessment_fields"]["How Vendor May Be Using AI"]))
+        self.assertNotIn("AppWorx", str(res["assessment_fields"]["Evidence Description along with OSINT Source(s) / Evidence Link"]))
+        self.assertEqual(len(res["evidence_records"]), 0)
+
+
+    def test_22_unsupported_baseline_findings_do_not_generate_score_and_distinguish_unassessed(self):
+        """Unsupported baseline findings return score=None, status='No validated AI-specific risk findings', not zero."""
+        from src.assessment.risk import calculate_ai_cyber_risk_score
+        from src.ui.report_export import build_vendor_scores_dataframe
+
+        # 1. AutomWorx baseline finding with rated severity/likelihood but no accepted positive evidence
+        automworx_findings = [{
+            "finding_id": "RISK-V-001-BASELINE-MONITORING",
+            "vendor_id": "V-001",
+            "theme": "evidence_gaps",
+            "risk_type": "assurance_gap",
+            "severity": "Low",
+            "likelihood": "Unlikely",
+            "evidence_ids": ["E-V001-01"],
+            "title": "Baseline vendor AI deployment monitoring",
+            "description": "Maintain periodic assurance monitoring for automated workloads.",
+        }]
+        # Curated disclosure indicating non-AI / rule-based workload automation
+        curated_evidence = [{
+            "evidence_id": "E-V001-01",
+            "vendor_id": "V-001",
+            "review_status": "Accepted",
+            "signal_types": ["rule_based_automation"],
+            "excerpt": "AppWorx workload automation platform provides rule-based scheduling without AI components.",
+        }]
+
+        risk_res = calculate_ai_cyber_risk_score(
+            automworx_findings,
+            evidence_records=curated_evidence,
+        )
+
+        # Must NOT manufacture a numeric score (e.g. 0.0)
+        self.assertIsNone(risk_res["score"])
+        self.assertEqual(risk_res["status"], "No validated AI-specific risk findings")
+        self.assertEqual(risk_res["scored_findings"], 0)
+        self.assertEqual(risk_res["unsupported_findings"], 1)
+        self.assertEqual(risk_res["unassessed_findings"], 0)
+        # Rationale must explicitly state unscored is not verified zero risk
+        self.assertIn("verified zero-risk result", risk_res["rationale"].lower())
+        self.assertIn("baseline assurance recommendations remain active", risk_res["rationale"].lower())
+
+        # 2. Incomplete / unassessed findings must be clearly distinguished
+        incomplete_findings = [{
+            "finding_id": "RISK-V-INCOMPLETE-01",
+            "vendor_id": "V-999",
+            "theme": "sensitive_data_exposure",
+            "risk_type": "conditional",
+            "severity": None,
+            "likelihood": "Possible",
+            "evidence_ids": [],
+        }]
+        incomplete_res = calculate_ai_cyber_risk_score(incomplete_findings)
+        self.assertIsNone(incomplete_res["score"])
+        self.assertEqual(incomplete_res["status"], "Assessment incomplete / unassessed — reviewer ratings required")
+        self.assertNotEqual(incomplete_res["status"], risk_res["status"])
+
+        # 3. Export scores DataFrame separates metrics and shows distinct status
+        import pandas as pd
+        inventory_df = pd.DataFrame([{
+            "Vendor ID": "V-001",
+            "Vendor Name": "AutomWorx Consulting",
+            "Service / Product Provided": "Workload automation",
+        }])
+        criticality_ratings = {
+            "V-001": {
+                "score": 62.5,
+                "tier": "Tier 2 - High",
+                "status": "Complete preliminary assessment",
+                "factor_coverage": 1.0,
+            }
+        }
+        investigation_assessments = {
+            "V-001": {
+                "status": "No",
+                "confidence": "Medium",
+                "rationale": ["Curated disclosure confirms deterministic rule-based scheduling."],
+            }
+        }
+        scores_df = build_vendor_scores_dataframe(
+            inventory_df,
+            criticality_ratings=criticality_ratings,
+            investigation_assessments=investigation_assessments,
+            risk_findings=automworx_findings,
+            evidence_records=curated_evidence,
+        )
+        v1_row = scores_df[scores_df["Vendor ID"] == "V-001"].iloc[0]
+        # Separate metrics
+        self.assertEqual(v1_row["Business Criticality (0-100)"], 62.5)
+        self.assertEqual(v1_row["AI-use Classification"], "No")
+        self.assertTrue(pd.isna(v1_row["AI Cybersecurity Risk (0-100)"]))
+        self.assertEqual(v1_row["Cyber Risk Status"], "No validated AI-specific risk findings")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
 

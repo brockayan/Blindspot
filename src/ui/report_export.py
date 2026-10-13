@@ -116,7 +116,27 @@ def _classification_dataframe(investigations):
     return pd.DataFrame(rows)
 
 
-def _vendor_scores_dataframe(inventory, assessments, investigations, evidence, findings):
+def _vendor_scores_dataframe(
+    inventory,
+    assessments=None,
+    investigations=None,
+    evidence=None,
+    findings=None,
+    **kwargs,
+):
+    if assessments is None:
+        assessments = kwargs.get("criticality_ratings", {})
+    if investigations is None:
+        investigations = kwargs.get("investigation_assessments", {})
+    if evidence is None:
+        evidence = kwargs.get("evidence_records", [])
+    if findings is None:
+        findings = kwargs.get("risk_findings", [])
+    assessments = assessments or {}
+    investigations = investigations or {}
+    evidence = list(evidence or [])
+    findings = list(findings or [])
+
     columns = [
         "Vendor ID",
         "Vendor Name",
@@ -151,7 +171,11 @@ def _vendor_scores_dataframe(inventory, assessments, investigations, evidence, f
             if str(_get(item, "vendor_id", "")).strip() == vendor_id
         ]
         criticality = assessments.get(vendor_id, {})
-        criticality_result = criticality.get("result")
+        criticality_result = (
+            criticality.get("result")
+            if isinstance(criticality, dict) and criticality.get("result") is not None
+            else criticality
+        )
         quality = calculate_evidence_score(vendor_evidence)
         risk = calculate_ai_cyber_risk_score(
             vendor_findings,
@@ -179,6 +203,9 @@ def _vendor_scores_dataframe(inventory, assessments, investigations, evidence, f
             ),
         })
     return pd.DataFrame(rows, columns=columns)
+
+
+build_vendor_scores_dataframe = _vendor_scores_dataframe
 
 
 def _format_workbook(buffer):
@@ -269,22 +296,10 @@ def populate_export_inventory(
         if vid.upper() == "V-000":
             continue
 
-        # If already populated with non-empty assessment, retain it
-        tier_val = row.get("Criticality Tier")
-        ai_val = row.get("AI Usage Detected (Y/N)") or row.get("AI Usage Detected")
-        if (
-            tier_val is not None
-            and not pd.isna(tier_val)
-            and str(tier_val).strip()
-            and ai_val is not None
-            and not pd.isna(ai_val)
-            and str(ai_val).strip()
-        ):
-            continue
+        vname = str(row.get("Vendor Name", "")).strip()
+        from src.collection.fixtures import get_curated_case_study_disclosure
 
-        from src.collection.pipeline import CURATED_CASE_STUDY_DISCLOSURES
-
-        curated = CURATED_CASE_STUDY_DISCLOSURES.get(vid.upper())
+        curated = get_curated_case_study_disclosure(vid, vendor_name=vname)
         crit = assessments.get(vid, {})
         crit_res = crit.get("result") if isinstance(crit, dict) else None
         inv = investigations.get(vid, {})
@@ -294,6 +309,26 @@ def populate_export_inventory(
         vendor_risk = [
             f for f in findings if str(_get(f, "vendor_id", "")).strip() == vid
         ]
+
+        # Check if this vendor has assessment data in the current session
+        has_vendor_assessment = (
+            vid in investigations
+            or vid in assessments
+            or bool(vendor_ev)
+            or bool(vendor_risk)
+        )
+        tier_val = row.get("Criticality Tier")
+        ai_val = row.get("AI Usage Detected (Y/N)") or row.get("AI Usage Detected")
+        # Retain pre-existing assessment only if there is no session assessment data for this vendor
+        if not has_vendor_assessment and (
+            tier_val is not None
+            and not pd.isna(tier_val)
+            and str(tier_val).strip()
+            and ai_val is not None
+            and not pd.isna(ai_val)
+            and str(ai_val).strip()
+        ):
+            continue
 
         tier = getattr(crit_res, "tier", None) or (
             crit.get("tier") if isinstance(crit, dict) else None
@@ -324,13 +359,10 @@ def populate_export_inventory(
                 else "Standard review — tier-driven"
             )
 
+        from src.assessment.classifier import status_to_detected_flag
         ai_status = inv.get("status", "")
-        if ai_status == "Confirmed":
-            ai_flag = "Yes"
-        elif ai_status == "Not Detected":
-            ai_flag = "No"
-        elif ai_status:
-            ai_flag = "Inconclusive"
+        if ai_status:
+            ai_flag = status_to_detected_flag(ai_status)
         elif curated:
             ai_flag = curated.get("ai_usage_detected", "Inconclusive")
         else:
@@ -338,22 +370,43 @@ def populate_export_inventory(
 
         if vendor_ev:
             first_ev = vendor_ev[0]
-            ev_desc = (
-                f"Source: {first_ev.get('source_title', 'Vendor Public Website')}, "
-                f"{first_ev.get('source_url', '')}. Excerpt: \"{first_ev.get('excerpt', '')}\""
+            is_curated = (
+                first_ev.get("data_origin") == "curated_case_study_disclosure"
+                or "[curated" in str(first_ev.get("source_title", "")).casefold()
             )
+            if is_curated:
+                blocked_note = ""
+                if vid == "V-004":
+                    blocked_note = " Completeness note: Live public web collection was blocked by vendor robots.txt policy restrictions; assessment relies on curated case-study simulation reference."
+                ev_desc = (
+                    f"[Curated Case-Study Reference — Not Independently Verified Live OSINT] "
+                    f"Source: {first_ev.get('source_title', 'Curated Reference')}, {first_ev.get('source_url', '')}. "
+                    f"Excerpt: \"{first_ev.get('excerpt', '')}\".{blocked_note}"
+                )
+            else:
+                retrieved_dt = str(first_ev.get("retrieved_at", ""))[:10]
+                dt_str = f" (retrieved {retrieved_dt})" if retrieved_dt else ""
+                ev_desc = (
+                    f"Independently retrieved live OSINT — "
+                    f"Source: {first_ev.get('source_title', 'Vendor Public Website')}, {first_ev.get('source_url', '')}{dt_str}. "
+                    f"Excerpt: \"{first_ev.get('excerpt', '')}\""
+                )
         elif curated:
+            blocked_note = ""
+            if vid == "V-004":
+                blocked_note = " Completeness note: Live public web collection was blocked by vendor robots.txt policy restrictions; assessment relies on curated case-study simulation reference."
             ev_desc = (
-                f"Primary source — {curated['source_title']}, {curated['primary_url']}. "
-                f"Excerpt: \"{curated['excerpt']}\""
+                f"[Curated Case-Study Reference — Not Independently Verified Live OSINT] "
+                f"Source: {curated['source_title']}, {curated['primary_url']}. "
+                f"Excerpt: \"{curated['excerpt']}\".{blocked_note}"
             )
         else:
             ev_desc = "No qualifying public evidence detected in investigated scope."
 
-        how_ai = inv.get("summary") or (
+        how_ai = (
             curated["how_vendor_may_be_using_ai"]
             if curated
-            else "No AI usage detected in scope."
+            else (inv.get("summary") or "No AI usage detected in scope.")
         )
 
         named_sub = (
@@ -362,11 +415,17 @@ def populate_export_inventory(
             else "None named — Inconclusive"
         )
 
-        risk_class = (
-            curated["ai_security_risk"]
-            if curated
-            else ("High" if tier == "Critical" and ai_flag == "Yes" else "Medium")
-        )
+        if ai_status == "Not Detected" or ai_flag == "No":
+            risk_class = "Low"
+        elif vendor_risk:
+            sev_rank = {"Critical": 4, "High": 3, "Moderate": 2, "Low": 1, "Unassessed": 0}
+            top_sev = max((_get(f, "severity", "Low") for f in vendor_risk), key=lambda s: sev_rank.get(s, 0), default="Low")
+            risk_class = "Medium" if top_sev == "Moderate" else top_sev
+        elif curated:
+            risk_class = curated["ai_security_risk"]
+        else:
+            risk_class = "High" if tier == "Critical" and ai_flag == "Yes" else "Medium"
+
         risk_rat = (
             curated["risk_rationale"]
             if curated
@@ -446,7 +505,18 @@ def build_assessment_workbook():
 
     sheets["Evidence Register"] = _records_to_dataframe(evidence)
     sheets["Review Log"] = _records_to_dataframe(reviews)
-    sheets["Risk Findings"] = _records_to_dataframe(findings)
+
+    from src.assessment.risk import findings_as_records
+    sheets["Risk Findings"] = (
+        pd.DataFrame(findings_as_records(findings))
+        if findings
+        else pd.DataFrame(columns=[
+            "Finding ID", "Vendor ID", "Vendor Name", "Risk Theme", "Theme Key",
+            "Risk Type", "Preliminary Rating", "Description", "Severity", "Likelihood",
+            "Severity Rationale", "Likelihood Rationale", "Rationale", "Evidence IDs",
+            "Recommended Action", "Status", "Reviewer", "Reviewed At (UTC)"
+        ])
+    )
     sheets["Collection Log"] = _records_to_dataframe(collection_log)
     sheets["Criticality Assessments"] = _criticality_dataframe(assessments)
     sheets["AI Investigation Summary"] = _classification_dataframe(
@@ -654,6 +724,44 @@ def show_report_export():
                 "spreadsheetml.sheet"
             ),
             key="download_assessment_workbook",
+        )
+
+    if isinstance(inventory, pd.DataFrame) and not inventory.empty:
+        export_inv_df = populate_export_inventory(
+            inventory,
+            assessments=assessments,
+            investigations=investigations,
+            evidence=evidence,
+            findings=findings,
+            relationships=relationships,
+        )
+        st.download_button(
+            "Download assessment inventory (CSV)",
+            data=export_inv_df.to_csv(index=False).encode("utf-8"),
+            file_name="Project_BlindSpot_Assessment_Inventory.csv",
+            mime="text/csv",
+            key="download_assessment_inventory_csv",
+        )
+
+    from src.assessment.risk import findings_as_records
+    if findings:
+        findings_export_df = pd.DataFrame(findings_as_records(findings))
+        st.download_button(
+            "Download full risk findings (CSV)",
+            data=findings_export_df.to_csv(index=False).encode("utf-8"),
+            file_name="Project_BlindSpot_Risk_Findings.csv",
+            mime="text/csv",
+            key="download_risk_findings_csv",
+        )
+
+    if evidence:
+        evidence_export_df = _records_to_dataframe(evidence)
+        st.download_button(
+            "Download evidence register (CSV)",
+            data=evidence_export_df.to_csv(index=False).encode("utf-8"),
+            file_name="blindspot_evidence_register.csv",
+            mime="text/csv",
+            key="download_evidence_register_csv",
         )
 
     st.caption(

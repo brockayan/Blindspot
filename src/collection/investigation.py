@@ -379,17 +379,48 @@ def run_full_investigation(
             if status != "success":
                 continue
 
+            is_github_search = candidate.get("discovery_method") == "github_public_repository_search_candidate"
+            directness = "unclear"
+            relevance = "unclear" if is_github_search else "relevant"
+            html_lower = html.casefold()
+            is_unrelated_repo = is_github_search and (
+                any(term in fetched_url.lower() for term in ("api-evangelist", "bnycftc", "awesome-", "profile"))
+                or "this is not our api" in html_lower
+                or "shorts creator" in html_lower
+            )
+
+            if is_unrelated_repo:
+                collection_log.append({
+                    "run_id": run_id,
+                    "vendor_id": str(vendor_id),
+                    "vendor_name": str(vendor_name),
+                    "source_url": fetched_url,
+                    "source_title": str(getattr(fetched, "title", "") or ""),
+                    "status": "excluded_unrelated_third_party",
+                    "http_status": getattr(fetched, "http_status", None),
+                    "error_category": "",
+                    "discovery_method": candidate["discovery_method"],
+                    "data_origin": "live_public_web",
+                    "details": "Excluded unrelated third-party repository from evidence register; not operated by or relevant to vendor service.",
+                    "checked_at": str(getattr(fetched, "retrieved_at", "") or _now()),
+                })
+                continue
+
             for extracted in extract_evidence_candidates(fetched):
                 evidence = create_evidence_record(
                     candidate=extracted,
                     vendor_id=str(vendor_id),
                     vendor_name=str(vendor_name),
                     source_type=_source_type(candidate),
+                    directness=directness,
+                    service_relevance=relevance,
                 )
                 evidence_record = evidence.to_dict()
                 evidence_record["discovery_method"] = candidate["discovery_method"]
                 evidence_record["data_origin"] = "live_public_web"
                 evidence_record["run_id"] = run_id
+                if is_github_search:
+                    evidence_record["grade"]["rationale"] += " (Lead only: public repository match does not establish vendor ownership or relevance to Meridian service.)"
                 evidence_records.append(evidence_record)
 
             current_depth = int(candidate.get("crawl_depth", 0) or 0)

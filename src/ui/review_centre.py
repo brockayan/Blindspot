@@ -9,6 +9,7 @@ from src.assessment.review import (
     review_evidence,
     apply_review_status,
     review_as_record,
+    sync_vendor_after_review,
 )
 from src.assessment.classifier import classify_ai_usage
 from src.assessment.scores import calculate_evidence_score
@@ -47,6 +48,7 @@ def _evidence_dict(record):
         "source_url": _get(record, "source_url", ""),
         "excerpt": _get(record, "excerpt", ""),
         "review_status": _get(record, "review_status", "Needs review"),
+        "data_origin": _get(record, "data_origin", "live_public_web"),
         "grade": {},
     }
 
@@ -76,10 +78,16 @@ def show_review_centre():
     for record in evidence_records:
         item = _evidence_dict(record)
         grade = item.get("grade") or {}
+        provenance = (
+            "Curated reference"
+            if item.get("data_origin") == "curated_case_study_disclosure"
+            else "Live public web"
+        )
 
         rows.append({
             "Evidence ID": item.get("evidence_id", ""),
             "Vendor": item.get("vendor_name", ""),
+            "Provenance": provenance,
             "Source URL": item.get("source_url", ""),
             "Review status": item.get("review_status", "Needs review"),
             "Evidence score": grade.get("score", "Not graded")
@@ -120,23 +128,24 @@ def show_review_centre():
                     }
                     review_log.append(rev_record)
 
-            # Re-evaluate all affected vendors
-            for rec in evidence_records:
-                vid = rec.get("vendor_id")
-                if vid:
-                    v_ev = [e for e in evidence_records if e.get("vendor_id") == vid]
-                    new_ai = classify_ai_usage(v_ev, collection_complete=True)
-                    st.session_state.setdefault("investigation_assessments", {})[vid] = {
-                        "vendor_id": vid,
-                        "vendor_name": rec.get("vendor_name", ""),
-                        "status": new_ai.status,
-                        "confidence": new_ai.confidence,
-                        "summary": new_ai.summary,
-                        "evidence_ids": new_ai.evidence_ids,
-                        "rationale": new_ai.rationale,
-                        "follow_up": new_ai.follow_up,
-                        "review_required": new_ai.review_required,
-                    }
+            # Re-evaluate all affected vendors and synchronize inventory and risk findings
+            unique_vids = {
+                _get(rec, "vendor_id")
+                for rec in evidence_records
+                if _get(rec, "vendor_id")
+            }
+            for vid in sorted(unique_vids):
+                sync_vendor_after_review(
+                    vid,
+                    evidence_records=evidence_records,
+                    inventory_df=st.session_state.get("inventory_df"),
+                    criticality_ratings=st.session_state.get("criticality_ratings", {}),
+                    investigation_assessments=st.session_state.setdefault("investigation_assessments", {}),
+                    risk_findings=st.session_state.setdefault("risk_findings", []),
+                    relationships=st.session_state.get("relationship_records", []),
+                    collection_log=st.session_state.get("collection_log", []),
+                    reviewer_name="Batch Approval",
+                )
 
             st.session_state["evidence_records"] = evidence_records
             st.session_state["review_log"] = review_log
@@ -182,11 +191,32 @@ def show_review_centre():
     with m3:
         st.metric("AI-Use Status", ai_status)
     with m4:
-        st.metric("Cyber Risk Index", f"{risk_score['score']:.1f}" if risk_score['score'] is not None else "Unassessed")
+        risk_status = risk_score.get("status", "Assessment incomplete / unassessed")
+        is_no_val = "No validated AI" in risk_status
+        risk_display = (
+            f"{risk_score['score']:.1f}"
+            if risk_score['score'] is not None
+            else ("No validated AI risk" if is_no_val else "Unassessed")
+        )
+        st.metric(
+            "Cyber Risk Index",
+            risk_display,
+            help=(
+                "No validated AI-specific risk findings qualify for scoring; baseline assurance recommendation active."
+                if is_no_val
+                else "Reviewer-rated prioritization index based on accepted evidence."
+            ),
+        )
 
     st.markdown("### Evidence details")
 
     st.write("**Vendor:**", original.get("vendor_name", "Unknown"))
+    provenance_badge = (
+        "⚠️ **Curated case study disclosure** (simulation reference — not independently retrieved live OSINT)"
+        if original.get("data_origin") == "curated_case_study_disclosure"
+        else "🌐 **Live public web** (retrieved OSINT)"
+    )
+    st.markdown(f"**Data Origin / Provenance:** {provenance_badge}")
     st.write("**Source:**", original.get("source_url", "Not provided"))
     st.write("**Excerpt:**", original.get("excerpt", "No excerpt available"))
 
@@ -338,25 +368,17 @@ def show_review_centre():
             st.session_state["review_log"] = review_log
             vendor_id = original.get("vendor_id")
             if vendor_id:
-                vendor_ev = [
-                    e for e in evidence_records
-                    if _get(e, "vendor_id") == vendor_id
-                ]
-                new_ai = classify_ai_usage(
-                    evidence_records=vendor_ev,
-                    collection_complete=True,
+                sync_vendor_after_review(
+                    vendor_id,
+                    evidence_records=evidence_records,
+                    inventory_df=st.session_state.get("inventory_df"),
+                    criticality_ratings=st.session_state.get("criticality_ratings", {}),
+                    investigation_assessments=st.session_state.setdefault("investigation_assessments", {}),
+                    risk_findings=st.session_state.setdefault("risk_findings", []),
+                    relationships=st.session_state.get("relationship_records", []),
+                    collection_log=st.session_state.get("collection_log", []),
+                    reviewer_name=reviewer.strip() or "Reviewer",
                 )
-                st.session_state.setdefault("investigation_assessments", {})[vendor_id] = {
-                    "vendor_id": vendor_id,
-                    "vendor_name": original.get("vendor_name", ""),
-                    "status": new_ai.status,
-                    "confidence": new_ai.confidence,
-                    "summary": new_ai.summary,
-                    "evidence_ids": new_ai.evidence_ids,
-                    "rationale": new_ai.rationale,
-                    "follow_up": new_ai.follow_up,
-                    "review_required": new_ai.review_required,
-                }
             st.session_state["assessment_workbook_bytes"] = None
 
             st.success(

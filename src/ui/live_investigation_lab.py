@@ -72,14 +72,23 @@ def _display_scores(vendor_id):
             "0–100; not AI-use confidence or a probability."
         ),
     )
-    columns[2].metric(
-        "AI cybersecurity risk",
+    risk_status = risk_score.get("status", "Assessment incomplete / unassessed")
+    is_no_val = "No validated AI" in risk_status
+    risk_display = (
         f"{risk_score['score']:.1f}/100"
         if risk_score["score"] is not None
-        else "Unassessed",
+        else ("No validated AI risk" if is_no_val else "Unassessed")
+    )
+    columns[2].metric(
+        "AI cybersecurity risk",
+        risk_display,
         help=(
-            "Highest active reviewer-rated severity/likelihood index "
-            "supported by accepted evidence; not a probability."
+            "No validated AI-specific risk findings qualify for scoring. Baseline assurance recommendations remain active; not a verified zero-risk result."
+            if is_no_val
+            else (
+                "Highest active reviewer-rated severity/likelihood index "
+                "supported by accepted evidence; not a probability."
+            )
         ),
     )
     with st.expander("Score methodology and coverage"):

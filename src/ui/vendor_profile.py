@@ -193,12 +193,25 @@ def show_vendor_profile():
         else "Unassessed",
         help="Accepted, relevant source quality; not AI-use confidence.",
     )
-    score_col2.metric(
-        "AI cybersecurity risk score",
+    risk_status = cyber_risk_score.get("status", "Assessment incomplete / unassessed")
+    is_no_validated_risk = "No validated AI" in risk_status
+    score_display = (
         f"{cyber_risk_score['score']:.1f}/100"
         if cyber_risk_score["score"] is not None
-        else "Unassessed",
-        help="Reviewer-rated index based on accepted-evidence-supported findings.",
+        else (
+            "No validated AI risk"
+            if is_no_validated_risk
+            else "Assessment incomplete / unassessed"
+        )
+    )
+    score_col2.metric(
+        "AI cybersecurity risk score",
+        score_display,
+        help=(
+            "No validated AI-specific risk findings qualify for scoring. Baseline assurance recommendations remain active; this is not a verified zero-risk result."
+            if is_no_validated_risk
+            else f"{risk_status}. Reviewer-rated index based on accepted-evidence-supported findings."
+        ),
     )
 
     # --------------------------------------------------------
@@ -363,6 +376,14 @@ def show_vendor_profile():
 
     st.divider()
     st.subheader("4. Security risk findings")
+
+    if is_no_validated_risk:
+        st.info(
+            "ℹ️ **No validated AI-specific risk findings:** "
+            "No AI-specific risk finding currently qualifies for scoring because no qualifying AI usage or accepted evidence substantively supports an AI risk theme. "
+            "The baseline assurance monitoring recommendation below remains active for vendor oversight, but does not generate a numeric AI risk index. "
+            "This unscored assessment must not be interpreted as a verified zero-risk result."
+        )
 
     if vendor_findings:
         findings_df = _as_dataframe(vendor_findings)

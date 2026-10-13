@@ -47,7 +47,6 @@ AI_SIGNAL_PATTERNS = {
         r"\bidp\b",
         r"\brobotic process automation\b",
         r"\brpa\b",
-        r"\bworkload automation\b",
         r"\bautomated underwriting\b",
     ],
     "model_provider": [
@@ -241,6 +240,15 @@ def extract_evidence_candidates(fetch_result, max_passages=100):
         if excerpt_hash in seen_hashes:
             continue
 
+        # Deduplicate repeated passages from the same URL:
+        # Cap at 1 candidate for repository URLs and at most 2 for other pages.
+        url_lower = source_url.casefold()
+        is_repo = "github.com/" in url_lower
+        max_per_url = 1 if is_repo else 2
+        same_url_count = sum(1 for c in candidates if c.source_url == source_url)
+        if same_url_count >= max_per_url:
+            continue
+
         seen_hashes.add(excerpt_hash)
 
         evidence_id = "E-" + excerpt_hash[:12].upper()
@@ -265,11 +273,47 @@ def extract_disclosed_model_providers(evidence_items) -> list[str]:
     """Extract distinct disclosed AI model/infrastructure providers from evidence.
 
     Does not infer providers from vendor names or general industry reputation.
+    Does not infer direct OpenAI integration solely from a reference to Azure OpenAI Service.
     """
     providers = set()
-    provider_patterns = {
-        "OpenAI": r"\bOpenAI\b|\bChatGPT\b|\bGPT-4\b|\bGPT-3\b",
-        "Azure OpenAI": r"\bAzure OpenAI\b|\bMicrosoft Azure AI\b|\bAzure AI\b",
+
+    texts = []
+    for item in evidence_items or []:
+        if isinstance(item, str):
+            texts.append(item)
+        elif hasattr(item, "excerpt"):
+            texts.append(str(item.excerpt))
+        elif isinstance(item, dict):
+            texts.append(str(item.get("excerpt", "")))
+
+    combined = "\n".join(texts)
+
+    # 1. Identify Azure OpenAI / Microsoft Azure AI
+    has_azure_openai = bool(
+        re.search(
+            r"\bAzure OpenAI\b|\bMicrosoft Azure AI\b|\bAzure AI\b",
+            combined,
+            flags=re.IGNORECASE,
+        )
+    )
+    if has_azure_openai:
+        providers.add("Microsoft Azure OpenAI Service")
+
+    # 2. Check for standalone OpenAI (excluding Azure OpenAI references)
+    sanitized_for_openai = re.sub(
+        r"\b(?:Microsoft\s+)?Azure\s+(?:OpenAI(?:\s+Service)?|AI)\b",
+        "",
+        combined,
+        flags=re.IGNORECASE,
+    )
+    if re.search(
+        r"\bOpenAI\b|\bChatGPT\b|\bGPT-4\b|\bGPT-3\b",
+        sanitized_for_openai,
+        flags=re.IGNORECASE,
+    ):
+        providers.add("OpenAI")
+
+    other_patterns = {
         "Anthropic": r"\bAnthropic\b|\bClaude\b",
         "Google Cloud / Gemini": r"\bGoogle Gemini\b|\bVertex AI\b|\bGoogle Cloud AI\b",
         "Amazon Bedrock / AWS": r"\bAmazon Bedrock\b|\bAWS Bedrock\b|\bAWS SageMaker\b",
@@ -282,17 +326,7 @@ def extract_disclosed_model_providers(evidence_items) -> list[str]:
         "Hugging Face": r"\bHugging Face\b",
     }
 
-    texts = []
-    for item in evidence_items or []:
-        if isinstance(item, str):
-            texts.append(item)
-        elif hasattr(item, "excerpt"):
-            texts.append(str(item.excerpt))
-        elif isinstance(item, dict):
-            texts.append(str(item.get("excerpt", "")))
-
-    combined = "\n".join(texts)
-    for canonical_name, pattern in provider_patterns.items():
+    for canonical_name, pattern in other_patterns.items():
         if re.search(pattern, combined, flags=re.IGNORECASE):
             providers.add(canonical_name)
 
